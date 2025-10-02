@@ -103,14 +103,34 @@ class PDHCollector(MetricsCollector):
             return {}
     
     def _filter_data(self, data: Dict[str, float]) -> Dict[str, float]:
+        """
+        エンジンデータをフィルタリングする
+        
+        Args:
+            data: 生のエンジンデータ (インスタンス名 -> 使用率)
+            
+        Returns:
+            フィルタリング済みのデータ
+        """
         filtered = {}
-        for k, v in data.items():
-            if self.include_names and not any(tag.lower() in k.lower() for tag in self.include_names):
+        for name, value in data.items():
+            # include_namesが指定されている場合、そのキーワードを含むもののみ
+            if self.include_names and not any(tag.lower() in name.lower() for tag in self.include_names):
                 continue
-            if self.exclude_contains and any(tag.lower() in k.lower() for tag in self.exclude_contains):
+            
+            # exclude_containsが指定されている場合、そのキーワードを含むものを除外
+            if self.exclude_contains and any(tag.lower() in name.lower() for tag in self.exclude_contains):
                 continue
-            if v is not None and not (isinstance(v, float) and (math.isnan(v) or v < 0)):
-                filtered[k] = v
+            
+            # 無効・NaNを除外
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isnan(numeric) or numeric < 0:
+                continue
+            
+            filtered[name] = numeric
         return filtered
 
 class SystemCollector(MetricsCollector):
@@ -168,17 +188,43 @@ class UtilityFunctions:
     
     @staticmethod
     def summarize_engine_util(data: Dict[str, float], include_names: List[str] = None) -> Tuple[float, List[Tuple[str, float]]]:
-        """エンジン使用率を集計"""
+        """
+        PDHのGPU/NPU Engine*(インスタンス)を集計。
+        
+        Args:
+            data: エンジンデータ (インスタンス名 -> 使用率)
+            include_names: サマリに含めたいキーワード（例: ['Compute', '3D']）
+            
+        Returns:
+            (overall_percent, top5_list): 全体使用率とトップ5のリスト
+        """
         if not data:
             return (0.0, [])
         
-        top = sorted(data.items(), key=lambda x: x[1], reverse=True)[:5]
+        # データの有効性チェック
+        filtered = {}
+        for name, value in data.items():
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isnan(numeric) or numeric < 0:
+                continue
+            filtered[name] = numeric
         
-        # Compute/3D Engine の場合は最大値、その他は平均値
-        if include_names and any(name.lower() in ['3d', 'compute'] for name in include_names):
-            overall = max(data.values()) if data else 0.0
+        if not filtered:
+            return (0.0, [])
+        
+        # トップ5のリストを作成
+        top = sorted(filtered.items(), key=lambda item: item[1], reverse=True)[:5]
+        
+        # Compute Engine専用の場合、より精密な計算
+        if include_names and any(name.lower() in ['compute', 'engtype_compute'] for name in include_names):
+            # Compute Engineの場合、最大値を採用（並列処理を考慮）
+            overall = max(filtered.values()) if filtered else 0.0
         else:
-            overall = sum(v for _, v in top) / len(top) if top else 0.0
+            # 従来通りの平均値計算
+            overall = sum(val for _, val in top) / len(top) if top else 0.0
         
         return (overall, top)
     
@@ -272,10 +318,11 @@ class HardwareMonitor:
     
     def __init__(self):
         self.system_collector = SystemCollector()
+        # GPU監視：Computeエンジンのみを対象とし、Copy/Video/3Dを除外
         self.gpu_collector = PDHCollector(
             r"\GPU Engine(*)\Utilization Percentage",
-            include_names=["Compute", "engtype_Compute"],
-            exclude_contains=["Copy", "Video", "3D"]
+            include_names=["Compute"],  # Computeエンジンのみを対象
+            exclude_contains=["Copy", "Video", "3D"]  # Copy, Video, 3D系を除外
         )
         self.npu_collector = PDHCollector(r"\NPU Engine(*)\Utilization Percentage")
         
@@ -293,6 +340,110 @@ class HardwareMonitor:
         
         # NPU検出情報
         self.intel_ai_boost_detected = NPUDetector.detect_intel_ai_boost()
+        
+        # GPU監視の可用性チェック
+        self._gpu_available = self.gpu_collector.is_available()
+        if not self._gpu_available:
+            print("Warning: GPU Performance Counters not available - GPU monitoring disabled")
+    
+    def get_gpu_usage(self) -> Tuple[float, List[Tuple[str, float]]]:
+        """
+        GPU Compute使用率を取得
+        
+        Returns:
+            (overall_percent, top_engines): 全体使用率とトップエンジンのリスト
+        """
+        if not self._gpu_available:
+            return (0.0, [])
+        
+        try:
+            gpu_data = self.gpu_collector.collect()
+            if not gpu_data:
+                return (0.0, [])
+            
+            # Compute Engineの使用率を計算
+            overall, top = UtilityFunctions.summarize_engine_util(
+                gpu_data, 
+                include_names=["Compute"]  # Computeエンジンのみ
+            )
+            
+            # 値を0-100の範囲にクランプ
+            clamped_overall = max(0.0, min(100.0, overall))
+            clamped_top = [(name, max(0.0, min(100.0, val))) for name, val in top]
+            
+            return (clamped_overall, clamped_top)
+            
+        except Exception as e:
+            print(f"GPU monitoring error: {e}")
+            return (0.0, [])
+    
+    def get_gpu_detailed_info(self) -> Dict[str, Any]:
+        """
+        詳細なGPU利用情報を取得（フロントエンド表示用）
+        
+        Returns:
+            GPU利用状況の詳細情報
+        """
+        if not self._gpu_available:
+            return {
+                "available": False,
+                "compute_percent": 0.0,
+                "overall_percent": 0.0,
+                "engines": {},
+                "top_engines": [],
+                "compute_engines": [],
+                "method": "pdh_unavailable"
+            }
+        
+        try:
+            gpu_data = self.gpu_collector.collect()
+            if not gpu_data:
+                return {
+                    "available": True,
+                    "compute_percent": 0.0,
+                    "overall_percent": 0.0,
+                    "engines": {},
+                    "top_engines": [],
+                    "compute_engines": [],
+                    "method": "pdh_no_data"
+                }
+            
+            # Compute Engine使用率
+            compute_overall, compute_top = UtilityFunctions.summarize_engine_util(
+                gpu_data,
+                include_names=["Compute"]
+            )
+            
+            # 全体GPU使用率（Copy除く）
+            overall_data = {k: v for k, v in gpu_data.items() 
+                          if not any(exclude.lower() in k.lower() for exclude in ["Copy"])}
+            overall_percent, overall_top = UtilityFunctions.summarize_engine_util(overall_data)
+            
+            # 値をクランプ
+            def clamp(value: float) -> float:
+                return max(0.0, min(100.0, float(value)))
+            
+            return {
+                "available": True,
+                "compute_percent": clamp(compute_overall),
+                "overall_percent": clamp(overall_percent),
+                "engines": {name: clamp(val) for name, val in gpu_data.items()},
+                "top_engines": [(name, clamp(val)) for name, val in overall_top[:3]],
+                "compute_engines": [(name, clamp(val)) for name, val in compute_top[:3]],
+                "method": "pdh"
+            }
+            
+        except Exception as e:
+            print(f"Detailed GPU monitoring error: {e}")
+            return {
+                "available": False,
+                "compute_percent": 0.0,
+                "overall_percent": 0.0,
+                "engines": {},
+                "top_engines": [],
+                "compute_engines": [],
+                "method": "error"
+            }
     
     def start_monitoring(self):
         """監視開始"""
@@ -334,8 +485,9 @@ class HardwareMonitor:
             self.averages['net_send'].add(sys_data['net_send_rate'])
             self.averages['net_recv'].add(sys_data['net_recv_rate'])
         
-        if gpu_data:
-            gpu_overall, _ = UtilityFunctions.summarize_engine_util(gpu_data, ["Compute", "engtype_Compute"])
+        # 改良されたGPU使用率計算を使用
+        if self._gpu_available:
+            gpu_overall, _ = self.get_gpu_usage()
             self.averages['gpu'].add(gpu_overall)
         
         if npu_data:
@@ -367,12 +519,15 @@ class HardwareMonitor:
         net_curr = self.format_net_curr(sys_data['net_send_rate'], sys_data['net_recv_rate'])
         print(f"Net   : avg {net_avg} | curr {net_curr}")
         
-        # GPU
-        gpu_overall, gpu_top = UtilityFunctions.summarize_engine_util(gpu_data, ["Compute", "engtype_Compute"])
-        gpu_avg = f"{self.averages['gpu'].average():5.1f}%" if self.averages['gpu'].has_samples() else "  n/a"
-        gpu_curr = f"{gpu_overall:5.1f}%" if gpu_data else "  n/a"
-        gpu_top_str = UtilityFunctions.format_top_list(gpu_top) if gpu_top else "n/a"
-        print(f"GPUComp: avg {gpu_avg} | curr {gpu_curr} | top {gpu_top_str}")
+        # GPU - 改良されたGPU監視を使用
+        if self._gpu_available:
+            gpu_overall, gpu_top = self.get_gpu_usage()
+            gpu_avg = f"{self.averages['gpu'].average():5.1f}%" if self.averages['gpu'].has_samples() else "  n/a"
+            gpu_curr = f"{gpu_overall:5.1f}%"
+            gpu_top_str = UtilityFunctions.format_top_list(gpu_top) if gpu_top else "n/a"
+            print(f"GPUComp: avg {gpu_avg} | curr {gpu_curr} | top {gpu_top_str}")
+        else:
+            print("GPUComp: n/a (counters not available)")
         
         # NPU
         npu_overall, npu_top = UtilityFunctions.summarize_engine_util(npu_data)
