@@ -5,6 +5,9 @@ import itertools
 import math
 from collections import defaultdict
 
+# AI活動検出のインポート
+from ai_activity_detector import AIActivityDetector, NPUUsageEstimator, format_ai_activity_status
+
 # ----- GPU/NPU (PDH) via pywin32 -----
 try:
     import win32pdh
@@ -12,13 +15,7 @@ try:
 except Exception:
     HAS_PDH = False
 
-# ----- NVIDIA fallback via NVML -----
-try:
-    import pynvml
-    pynvml.nvmlInit()
-    HAS_NVML = True
-except Exception:
-    HAS_NVML = False
+
 
 REFRESH_SEC = 1.0
 
@@ -107,8 +104,10 @@ def summarize_engine_util(engine_dict, include_names=None, exclude_contains=None
     """
     filt = {}
     for k, v in engine_dict.items():
+        # include_names が指定されている場合、そのキーワードを含むもののみ
         if include_names and not any(tag.lower() in k.lower() for tag in include_names):
             continue
+        # exclude_contains が指定されている場合、そのキーワードを含むものを除外
         if exclude_contains and any(tag.lower() in k.lower() for tag in exclude_contains):
             continue
         # 無効・NaNを除外
@@ -118,10 +117,21 @@ def summarize_engine_util(engine_dict, include_names=None, exclude_contains=None
 
     if not filt:
         return (0.0, [])
-    # エンジン別の%は同時並行で重複もあるが、目安として上位表示
+    
+    # 3D/Compute Engine専用の場合、より精密な計算
+    if include_names and any(name.lower() in ['3d', 'compute'] for name in include_names):
+        # 3D/Compute Engineの場合、最大値を採用（並列処理を考慮）
+        if filt:
+            overall = max(filt.values())
+        else:
+            overall = 0.0
+    else:
+        # 従来通りの平均値計算
+        top = sorted(filt.items(), key=lambda x: x[1], reverse=True)[:5]
+        overall = sum(v for _, v in top) / len(top) if top else 0.0
+    
+    # トップ5のリストは常に作成
     top = sorted(filt.items(), key=lambda x: x[1], reverse=True)[:5]
-    # 総和は100%超えることがあるため、上位の平均を目安に
-    overall = sum(v for _, v in top) / len(top)
     return (overall, top)
 
 def format_top_list(top_list, max_items=5):
@@ -155,9 +165,58 @@ def print_header():
     print("="*78)
     print("Ctrl+C to stop\n")
 
+def print_npu_status():
+    """NPUデバイスの状況を表示"""
+    print("NPU Detection Status:")
+    print("-" * 40)
+    
+    # Intel AI Boost の検出
+    intel_ai_boost_found = False
+    try:
+        import wmi
+        c = wmi.WMI()
+        devices = c.Win32_PnPEntity()
+        for device in devices:
+            device_name = str(getattr(device, 'Name', ''))
+            if 'Intel(R) AI Boost' in device_name:
+                intel_ai_boost_found = True
+                print(f"✓ Intel AI Boost NPU detected: {device_name}")
+                break
+    except Exception:
+        pass
+    
+    if not intel_ai_boost_found:
+        print("✗ Intel AI Boost NPU not detected")
+    
+    # Performance Counter の確認
+    try:
+        import win32pdh
+        try:
+            paths = win32pdh.ExpandCounterPath(r"\NPU Engine(*)\Utilization Percentage")
+            if paths:
+                print(f"✓ NPU Performance Counters available: {len(paths)} instances")
+            else:
+                print("✗ NPU Performance Counters not available")
+        except Exception:
+            print("✗ NPU Performance Counters not available")
+    except ImportError:
+        print("✗ win32pdh not available for NPU counter check")
+    
+    if intel_ai_boost_found:
+        print("\nNOTE: Intel AI Boost NPU is present but may require:")
+        print("  - Windows 11 24H2 or later for full PDH counter support")
+        print("  - Latest Intel Graphics drivers")
+        print("  - NPU workload to show meaningful utilization")
+        print("  - Use Task Manager > Performance tab to verify NPU visibility")
+    else:
+        print("\nNOTE: No NPU detected on this system")
+    
+    print()  # 空行
+
 
 def main():
     print_header()
+    print_npu_status()
 
     # CPU priming
     psutil.cpu_percent(interval=None)
@@ -180,16 +239,22 @@ def main():
                 npu_reader = None
         except Exception:
             npu_reader = None
-
-    # NVML devices
-    nvml_handles = []
-    if HAS_NVML:
+        
+        # Intel AI Boost デバイスの存在確認
+        intel_ai_boost_detected = False
         try:
-            count = pynvml.nvmlDeviceGetCount()
-            for i in range(count):
-                nvml_handles.append(pynvml.nvmlDeviceGetHandleByIndex(i))
+            import wmi
+            c = wmi.WMI()
+            devices = c.Win32_PnPEntity()
+            for device in devices:
+                device_name = str(getattr(device, 'Name', ''))
+                if 'Intel(R) AI Boost' in device_name:
+                    intel_ai_boost_detected = True
+                    break
         except Exception:
-            nvml_handles = []
+            pass
+
+
 
     avg_cpu = RunningAverage()
     avg_mem = RunningAverage()
@@ -200,8 +265,10 @@ def main():
     avg_net_send = RunningAverage()
     avg_net_recv = RunningAverage()
 
-    nvml_gpu_avgs = [RunningAverage() for _ in nvml_handles]
-    nvml_mem_avgs = [RunningAverage() for _ in nvml_handles]
+    # AI活動検出器とNPU推定器の初期化
+    ai_detector = AIActivityDetector()
+    npu_estimator = NPUUsageEstimator()
+    ai_detector.start_monitoring()
 
     last_disk_io = psutil.disk_io_counters()
     last_net_io = psutil.net_io_counters()
@@ -248,15 +315,15 @@ def main():
                 avg_net_recv.add(net_recv_rate)
             last_net_io = net
 
-            # ----- GPU via PDH -----
+            # ----- GPU via PDH (Compute Engine focused) -----
             gpu_now = None
             gpu_top = []
             if gpu_reader:
                 gsample = gpu_reader.sample()
                 g_overall, g_top = summarize_engine_util(
                     gsample,
-                    include_names=None,
-                    exclude_contains=["Copy"]
+                    include_names=["Compute", "engtype_Compute"],  # Compute Engine のみを対象
+                    exclude_contains=["Copy", "Video", "3D"]  # Copy, Video, 3D系を除外
                 )
                 gpu_top = g_top
                 if g_top:
@@ -276,30 +343,24 @@ def main():
                 if n_top:
                     npu_now = n_overall
 
-            # ----- NVIDIA fallback (per-device) -----
-            nvml_lines = []
-            if nvml_handles:
-                nvml_util_values = []
-                for idx, handle in enumerate(nvml_handles):
-                    try:
-                        util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                        name = pynvml.nvmlDeviceGetName(handle).decode("utf-8", errors="ignore")
-                        nvml_util_values.append(util.gpu)
-                        nvml_gpu_avgs[idx].add(util.gpu)
-                        nvml_mem_avgs[idx].add(util.memory)
-                        nvml_lines.append(
-                            f"GPU{idx} ({name}): curr {util.gpu}% gpu / {util.memory}% mem | "
-                            f"avg {nvml_gpu_avgs[idx].average():.0f}% gpu / {nvml_mem_avgs[idx].average():.0f}% mem"
-                        )
-                    except Exception:
-                        nvml_lines.append(f"GPU{idx}: NVML read failed")
-                if gpu_now is None and nvml_util_values:
-                    gpu_now = sum(nvml_util_values) / len(nvml_util_values)
+
 
             if gpu_now is not None:
                 avg_gpu.add(gpu_now)
             if npu_now is not None:
                 avg_npu.add(npu_now)
+
+            # ----- AI活動検出とNPU使用推定 -----
+            current_ai_activity = ai_detector.get_current_ai_activity()
+            
+            # NPU推定値の更新
+            if current_ai_activity['active']:
+                npu_estimator.update_ai_cpu(cpu_overall)
+            else:
+                npu_estimator.update_baseline_cpu(cpu_overall)
+            
+            # AI活動状況の取得
+            ai_status, npu_estimated = format_ai_activity_status(ai_detector, npu_estimator)
 
             print("\n" + "-"*78)
 
@@ -356,15 +417,42 @@ def main():
             gpu_avg_str = f"{avg_gpu.average():5.1f}%" if avg_gpu.has_samples() else "  n/a"
             gpu_curr_str = f"{gpu_now:5.1f}%" if gpu_now is not None else "  n/a"
             gpu_top_str = format_top_list(gpu_top) if gpu_top else "n/a"
-            print(f"GPU   : avg {gpu_avg_str} | curr {gpu_curr_str} | top {gpu_top_str}")
+            print(f"GPUComp: avg {gpu_avg_str} | curr {gpu_curr_str} | top {gpu_top_str}")  # Compute使用率を表示
 
+            # NPU/AI活動の表示
+            if npu_now is not None:
+                # PDH カウンターからの直接値がある場合
+                npu_curr_str = f"{npu_now:5.1f}%"
+                npu_status = ""
+            elif npu_estimated != "n/a":
+                # AI活動からの推定値がある場合
+                npu_curr_str = npu_estimated
+                npu_status = " (AI-estimated)"
+            else:
+                # 何も検出されない場合
+                npu_curr_str = "  n/a"
+                npu_status = ""
+            
+            # Intel AI Boost検出状況を含めた詳細表示
+            if intel_ai_boost_detected and npu_reader is None:
+                if current_ai_activity['active']:
+                    npu_status += f" (Intel AI Boost, {ai_status})"
+                else:
+                    npu_status += " (Intel AI Boost detected, no PDH counter)"
+            elif intel_ai_boost_detected:
+                npu_status += " (Intel AI Boost available)"
+            elif npu_reader is None:
+                if current_ai_activity['active']:
+                    npu_status += f" ({ai_status})"
+                else:
+                    npu_status += " (no NPU counter available)"
+            
             npu_avg_str = f"{avg_npu.average():5.1f}%" if avg_npu.has_samples() else "  n/a"
-            npu_curr_str = f"{npu_now:5.1f}%" if npu_now is not None else "  n/a"
             npu_top_str = format_top_list(npu_top) if npu_top else "n/a"
-            print(f"NPU   : avg {npu_avg_str} | curr {npu_curr_str} | top {npu_top_str}")
+            
+            print(f"NPU   : avg {npu_avg_str} | curr {npu_curr_str} | top {npu_top_str}{npu_status}")
 
-            if nvml_lines:
-                print("NVIDIA (NVML): " + " || ".join(nvml_lines))
+
 
             last_sample_ts = loop_start
             time.sleep(REFRESH_SEC)
@@ -372,10 +460,8 @@ def main():
         except KeyboardInterrupt:
             break
 
-    if HAS_NVML:
-        try:
-            pynvml.nvmlShutdown()
-        except Exception:
-            pass
+    # クリーンアップ
+    ai_detector.stop_monitoring()
+
 if __name__ == "__main__":
     main()
