@@ -1,12 +1,10 @@
 # monitor_hw_usage.py
 import time
 import psutil
-import itertools
 import math
 from collections import defaultdict
-
-# AI活動検出のインポート
-from ai_activity_detector import AIActivityDetector, NPUUsageEstimator, format_ai_activity_status
+from abc import ABC, abstractmethod
+from typing import Dict, List, Tuple, Optional, Any
 
 # ----- GPU/NPU (PDH) via pywin32 -----
 try:
@@ -15,233 +13,207 @@ try:
 except Exception:
     HAS_PDH = False
 
-
-
 REFRESH_SEC = 1.0
 
+class MetricsCollector(ABC):
+    """メトリクス収集の抽象基底クラス"""
+    
+    @abstractmethod
+    def collect(self) -> Dict[str, Any]:
+        pass
+    
+    @abstractmethod
+    def is_available(self) -> bool:
+        pass
+
 class RunningAverage:
+    """効率的な累積平均計算"""
     def __init__(self):
         self._total = 0.0
         self._count = 0
 
-    def add(self, value):
-        if value is None:
-            return
-        self._total += float(value)
-        self._count += 1
+    def add(self, value: Optional[float]) -> None:
+        if value is not None:
+            self._total += float(value)
+            self._count += 1
 
-    def has_samples(self):
+    def has_samples(self) -> bool:
         return self._count > 0
 
-    def average(self):
+    def average(self) -> float:
         return self._total / self._count if self._count else 0.0
 
-class PDHWildcardReader:
-    """
-    Read Windows Performance Counters with wildcard instances,
-    e.g. r'\\GPU Engine(*)\\Utilization Percentage'
-         r'\\NPU Engine(*)\\Utilization Percentage' (存在すれば)
-    """
-    def __init__(self, path_pattern):
+class PDHCollector(MetricsCollector):
+    """PDH (Performance Data Helper) メトリクスコレクター"""
+    
+    def __init__(self, path_pattern: str, include_names: List[str] = None, exclude_contains: List[str] = None):
         self.path_pattern = path_pattern
+        self.include_names = include_names or []
+        self.exclude_contains = exclude_contains or []
         self.query = None
-        self.counters = []  # list of (hCounter, path)
-
-    def _build(self):
-        # Expand wildcard to concrete counter paths
-        paths = win32pdh.ExpandCounterPath(self.path_pattern)
-        if not paths:
-            return False
-        self.query = win32pdh.OpenQuery()
         self.counters = []
-        for p in paths:
-            try:
-                h = win32pdh.AddCounter(self.query, p)
-                self.counters.append((h, p))
-            except Exception:
-                # 一部のカウンタは追加に失敗することがあるのでスキップ
-                pass
-        # 初回サンプル
-        win32pdh.CollectQueryData(self.query)
-        return len(self.counters) > 0
-
-    def available(self):
+        self._available = False
+        self._try_build()
+    
+    def _try_build(self) -> None:
         if not HAS_PDH:
-            return False
+            return
         try:
-            return self._build()
+            paths = win32pdh.ExpandCounterPath(self.path_pattern)
+            if not paths:
+                return
+            
+            self.query = win32pdh.OpenQuery()
+            self.counters = []
+            for p in paths:
+                try:
+                    h = win32pdh.AddCounter(self.query, p)
+                    self.counters.append((h, p))
+                except Exception:
+                    pass
+            
+            if self.counters:
+                win32pdh.CollectQueryData(self.query)
+                self._available = True
         except Exception:
-            return False
+            pass
 
-    def sample(self):
-        """
-        Returns dict: {instance_label: value_percent}
-        """
-        if not self.query or not self.counters:
+    def is_available(self) -> bool:
+        return self._available
+
+    def collect(self) -> Dict[str, Any]:
+        if not self._available:
             return {}
-        time.sleep(0.2)  # PDHは2回目以降の差分で%を計算するので短い待ち
-        win32pdh.CollectQueryData(self.query)
-        data = {}
-        for h, p in self.counters:
-            try:
-                t, val = win32pdh.GetFormattedCounterValue(h, win32pdh.PDH_FMT_DOUBLE)
-                # インスタンス名抽出（\Object(instance)\Counter 形式）
-                inst = p
-                # 見やすくするため「engtype_#」等を短縮
-                if '(' in p and ')' in p:
-                    inst = p[p.find('(')+1:p.find(')')]
-                data[inst] = float(val)
-            except Exception:
-                pass
-        return data
-
-def summarize_engine_util(engine_dict, include_names=None, exclude_contains=None):
-    """
-    PDHのGPU/NPU Engine*(インスタンス)を集計。
-    - include_names: サマリに含めたいキーワード（例: 'engtype_3D'）
-    - exclude_contains: 除外キーワード
-    return: (overall_percent, top5_list)
-    """
-    filt = {}
-    for k, v in engine_dict.items():
-        # include_names が指定されている場合、そのキーワードを含むもののみ
-        if include_names and not any(tag.lower() in k.lower() for tag in include_names):
-            continue
-        # exclude_contains が指定されている場合、そのキーワードを含むものを除外
-        if exclude_contains and any(tag.lower() in k.lower() for tag in exclude_contains):
-            continue
-        # 無効・NaNを除外
-        if v is None or (isinstance(v, float) and (math.isnan(v) or v < 0)):
-            continue
-        filt[k] = v
-
-    if not filt:
-        return (0.0, [])
-    
-    # 3D/Compute Engine専用の場合、より精密な計算
-    if include_names and any(name.lower() in ['3d', 'compute'] for name in include_names):
-        # 3D/Compute Engineの場合、最大値を採用（並列処理を考慮）
-        if filt:
-            overall = max(filt.values())
-        else:
-            overall = 0.0
-    else:
-        # 従来通りの平均値計算
-        top = sorted(filt.items(), key=lambda x: x[1], reverse=True)[:5]
-        overall = sum(v for _, v in top) / len(top) if top else 0.0
-    
-    # トップ5のリストは常に作成
-    top = sorted(filt.items(), key=lambda x: x[1], reverse=True)[:5]
-    return (overall, top)
-
-def format_top_list(top_list, max_items=5):
-    return ", ".join([f"{k}:{v:.0f}%" for k, v in top_list[:max_items]])
-
-def human_bytes(n):
-    if n is None:
-        return "n/a"
-    units = ['B','KB','MB','GB','TB']
-    i = 0
-    f = float(n)
-    while f >= 1024 and i < len(units)-1:
-        f /= 1024.0
-        i += 1
-    return f"{f:.1f}{units[i]}"
-
-def human_bytes_per_s(n):
-    if n is None:
-        return "n/a"
-    units = ['B/s','KB/s','MB/s','GB/s','TB/s']
-    i = 0
-    f = float(n)
-    while f >= 1024 and i < len(units)-1:
-        f /= 1024.0
-        i += 1
-    return f"{f:.1f}{units[i]}"
-
-def print_header():
-    print("="*78)
-    print(" Windows Hardware Utilization Monitor (Task Manager-like) ")
-    print("="*78)
-    print("Ctrl+C to stop\n")
-
-def print_npu_status():
-    """NPUデバイスの状況を表示"""
-    print("NPU Detection Status:")
-    print("-" * 40)
-    
-    # Intel AI Boost の検出
-    intel_ai_boost_found = False
-    try:
-        import wmi
-        c = wmi.WMI()
-        devices = c.Win32_PnPEntity()
-        for device in devices:
-            device_name = str(getattr(device, 'Name', ''))
-            if 'Intel(R) AI Boost' in device_name:
-                intel_ai_boost_found = True
-                print(f"✓ Intel AI Boost NPU detected: {device_name}")
-                break
-    except Exception:
-        pass
-    
-    if not intel_ai_boost_found:
-        print("✗ Intel AI Boost NPU not detected")
-    
-    # Performance Counter の確認
-    try:
-        import win32pdh
-        try:
-            paths = win32pdh.ExpandCounterPath(r"\NPU Engine(*)\Utilization Percentage")
-            if paths:
-                print(f"✓ NPU Performance Counters available: {len(paths)} instances")
-            else:
-                print("✗ NPU Performance Counters not available")
-        except Exception:
-            print("✗ NPU Performance Counters not available")
-    except ImportError:
-        print("✗ win32pdh not available for NPU counter check")
-    
-    if intel_ai_boost_found:
-        print("\nNOTE: Intel AI Boost NPU is present but may require:")
-        print("  - Windows 11 24H2 or later for full PDH counter support")
-        print("  - Latest Intel Graphics drivers")
-        print("  - NPU workload to show meaningful utilization")
-        print("  - Use Task Manager > Performance tab to verify NPU visibility")
-    else:
-        print("\nNOTE: No NPU detected on this system")
-    
-    print()  # 空行
-
-
-def main():
-    print_header()
-    print_npu_status()
-
-    # CPU priming
-    psutil.cpu_percent(interval=None)
-
-    # PDH readers
-    gpu_reader = None
-    npu_reader = None
-    if HAS_PDH:
-        try:
-            gpu_reader = PDHWildcardReader(r"\GPU Engine(*)\Utilization Percentage")
-            if not gpu_reader.available():
-                gpu_reader = None
-        except Exception:
-            gpu_reader = None
-
-        try:
-            # Windows 11/24H2 以降対応デバイスで存在する可能性あり
-            npu_reader = PDHWildcardReader(r"\NPU Engine(*)\Utilization Percentage")
-            if not npu_reader.available():
-                npu_reader = None
-        except Exception:
-            npu_reader = None
         
-        # Intel AI Boost デバイスの存在確認
-        intel_ai_boost_detected = False
+        try:
+            time.sleep(0.2)
+            win32pdh.CollectQueryData(self.query)
+            data = {}
+            
+            for h, p in self.counters:
+                try:
+                    t, val = win32pdh.GetFormattedCounterValue(h, win32pdh.PDH_FMT_DOUBLE)
+                    inst = p[p.find('(')+1:p.find(')')] if '(' in p and ')' in p else p
+                    data[inst] = float(val)
+                except Exception:
+                    pass
+            
+            return self._filter_data(data)
+        except Exception:
+            return {}
+    
+    def _filter_data(self, data: Dict[str, float]) -> Dict[str, float]:
+        filtered = {}
+        for k, v in data.items():
+            if self.include_names and not any(tag.lower() in k.lower() for tag in self.include_names):
+                continue
+            if self.exclude_contains and any(tag.lower() in k.lower() for tag in self.exclude_contains):
+                continue
+            if v is not None and not (isinstance(v, float) and (math.isnan(v) or v < 0)):
+                filtered[k] = v
+        return filtered
+
+class SystemCollector(MetricsCollector):
+    """システムメトリクス（CPU、メモリ、ディスク、ネットワーク）コレクター"""
+    
+    def __init__(self):
+        self.last_disk_io = None
+        self.last_net_io = None
+        self.last_sample_ts = time.monotonic()
+    
+    def is_available(self) -> bool:
+        return True
+    
+    def collect(self) -> Dict[str, Any]:
+        current_time = time.monotonic()
+        elapsed = max(current_time - self.last_sample_ts, 1e-6)
+        
+        # CPU & Memory
+        cpu_overall = psutil.cpu_percent(interval=None)
+        cpu_per = psutil.cpu_percent(interval=None, percpu=True)
+        vm = psutil.virtual_memory()
+        
+        # Disk I/O
+        disk_io = psutil.disk_io_counters()
+        disk_read_rate = disk_write_rate = None
+        if self.last_disk_io:
+            disk_read_rate = max(0.0, disk_io.read_bytes - self.last_disk_io.read_bytes) / elapsed
+            disk_write_rate = max(0.0, disk_io.write_bytes - self.last_disk_io.write_bytes) / elapsed
+        self.last_disk_io = disk_io
+        
+        # Network I/O
+        net_io = psutil.net_io_counters()
+        net_send_rate = net_recv_rate = None
+        if self.last_net_io:
+            net_send_rate = max(0.0, net_io.bytes_sent - self.last_net_io.bytes_sent) / elapsed
+            net_recv_rate = max(0.0, net_io.bytes_recv - self.last_net_io.bytes_recv) / elapsed
+        self.last_net_io = net_io
+        
+        self.last_sample_ts = current_time
+        
+        return {
+            'cpu_overall': cpu_overall,
+            'cpu_per_core': cpu_per,
+            'memory_percent': vm.percent,
+            'memory_used': vm.used,
+            'memory_total': vm.total,
+            'disk_read_rate': disk_read_rate,
+            'disk_write_rate': disk_write_rate,
+            'net_send_rate': net_send_rate,
+            'net_recv_rate': net_recv_rate
+        }
+
+class UtilityFunctions:
+    """ユーティリティ関数群"""
+    
+    @staticmethod
+    def summarize_engine_util(data: Dict[str, float], include_names: List[str] = None) -> Tuple[float, List[Tuple[str, float]]]:
+        """エンジン使用率を集計"""
+        if not data:
+            return (0.0, [])
+        
+        top = sorted(data.items(), key=lambda x: x[1], reverse=True)[:5]
+        
+        # Compute/3D Engine の場合は最大値、その他は平均値
+        if include_names and any(name.lower() in ['3d', 'compute'] for name in include_names):
+            overall = max(data.values()) if data else 0.0
+        else:
+            overall = sum(v for _, v in top) / len(top) if top else 0.0
+        
+        return (overall, top)
+    
+    @staticmethod
+    def format_top_list(top_list: List[Tuple[str, float]], max_items: int = 5) -> str:
+        return ", ".join([f"{k}:{v:.0f}%" for k, v in top_list[:max_items]])
+    
+    @staticmethod
+    def human_bytes(n: Optional[float]) -> str:
+        if n is None:
+            return "n/a"
+        units = ['B','KB','MB','GB','TB']
+        i, f = 0, float(n)
+        while f >= 1024 and i < len(units)-1:
+            f /= 1024.0
+            i += 1
+        return f"{f:.1f}{units[i]}"
+    
+    @staticmethod
+    def human_bytes_per_s(n: Optional[float]) -> str:
+        if n is None:
+            return "n/a"
+        units = ['B/s','KB/s','MB/s','GB/s','TB/s']
+        i, f = 0, float(n)
+        while f >= 1024 and i < len(units)-1:
+            f /= 1024.0
+            i += 1
+        return f"{f:.1f}{units[i]}"
+
+class NPUDetector:
+    """NPUデバイス検出クラス"""
+    
+    @staticmethod
+    def detect_intel_ai_boost() -> bool:
+        """Intel AI Boost NPUを検出"""
         try:
             import wmi
             c = wmi.WMI()
@@ -249,219 +221,208 @@ def main():
             for device in devices:
                 device_name = str(getattr(device, 'Name', ''))
                 if 'Intel(R) AI Boost' in device_name:
-                    intel_ai_boost_detected = True
-                    break
+                    return True
         except Exception:
             pass
-
-
-
-    avg_cpu = RunningAverage()
-    avg_mem = RunningAverage()
-    avg_gpu = RunningAverage()
-    avg_npu = RunningAverage()
-    avg_disk_read = RunningAverage()
-    avg_disk_write = RunningAverage()
-    avg_net_send = RunningAverage()
-    avg_net_recv = RunningAverage()
-
-    # AI活動検出器とNPU推定器の初期化
-    ai_detector = AIActivityDetector()
-    npu_estimator = NPUUsageEstimator()
-    ai_detector.start_monitoring()
-
-    last_disk_io = psutil.disk_io_counters()
-    last_net_io = psutil.net_io_counters()
-    last_sample_ts = time.monotonic()
-
-    while True:
+        return False
+    
+    @staticmethod
+    def check_npu_counters() -> bool:
+        """NPU Performance Countersの利用可能性をチェック"""
         try:
-            loop_start = time.monotonic()
-            elapsed = max(loop_start - last_sample_ts, 1e-6)
-
-            # ----- CPU -----
-            cpu_overall = psutil.cpu_percent(interval=None)
-            cpu_per = psutil.cpu_percent(interval=None, percpu=True)
-            avg_cpu.add(cpu_overall)
-
-            # ----- Memory -----
-            vm = psutil.virtual_memory()
-            mem_percent = vm.percent
-            avg_mem.add(mem_percent)
-
-            # ----- Disk (throughput per second) -----
-            disk_io = psutil.disk_io_counters()
-            disk_read_rate = None
-            disk_write_rate = None
-            if last_disk_io is not None:
-                disk_read_delta = max(0.0, disk_io.read_bytes - last_disk_io.read_bytes)
-                disk_write_delta = max(0.0, disk_io.write_bytes - last_disk_io.write_bytes)
-                disk_read_rate = disk_read_delta / elapsed
-                disk_write_rate = disk_write_delta / elapsed
-                avg_disk_read.add(disk_read_rate)
-                avg_disk_write.add(disk_write_rate)
-            last_disk_io = disk_io
-
-            # ----- Network (throughput per second) -----
-            net = psutil.net_io_counters()
-            net_send_rate = None
-            net_recv_rate = None
-            if last_net_io is not None:
-                net_send_delta = max(0.0, net.bytes_sent - last_net_io.bytes_sent)
-                net_recv_delta = max(0.0, net.bytes_recv - last_net_io.bytes_recv)
-                net_send_rate = net_send_delta / elapsed
-                net_recv_rate = net_recv_delta / elapsed
-                avg_net_send.add(net_send_rate)
-                avg_net_recv.add(net_recv_rate)
-            last_net_io = net
-
-            # ----- GPU via PDH (Compute Engine focused) -----
-            gpu_now = None
-            gpu_top = []
-            if gpu_reader:
-                gsample = gpu_reader.sample()
-                g_overall, g_top = summarize_engine_util(
-                    gsample,
-                    include_names=["Compute", "engtype_Compute"],  # Compute Engine のみを対象
-                    exclude_contains=["Copy", "Video", "3D"]  # Copy, Video, 3D系を除外
-                )
-                gpu_top = g_top
-                if g_top:
-                    gpu_now = g_overall
-
-            # ----- NPU via PDH -----
-            npu_now = None
-            npu_top = []
-            if npu_reader:
-                nsample = npu_reader.sample()
-                n_overall, n_top = summarize_engine_util(
-                    nsample,
-                    include_names=None,
-                    exclude_contains=None
-                )
-                npu_top = n_top
-                if n_top:
-                    npu_now = n_overall
+            import win32pdh
+            paths = win32pdh.ExpandCounterPath(r"\NPU Engine(*)\Utilization Percentage")
+            return bool(paths)
+        except Exception:
+            return False
+    
+    @staticmethod
+    def print_npu_status():
+        """NPU検出状況を表示"""
+        print("NPU Detection Status:")
+        print("-" * 40)
+        
+        intel_ai_boost_found = NPUDetector.detect_intel_ai_boost()
+        if intel_ai_boost_found:
+            print("✓ Intel AI Boost NPU detected")
+        else:
+            print("✗ Intel AI Boost NPU not detected")
+        
+        npu_counters_available = NPUDetector.check_npu_counters()
+        if npu_counters_available:
+            print("✓ NPU Performance Counters available")
+        else:
+            print("✗ NPU Performance Counters not available")
+            if intel_ai_boost_found:
+                print("    → Intel AI Boost NPU detected but PDH counters are not exposed")
+                print("    → This is common on current Windows versions")
+        
+        if intel_ai_boost_found:
+            print("\nCURRENT STATUS:")
+            print("  - NPU hardware: ✓ Detected (Intel AI Boost)")
+            print("  - PDH counters: ✗ Not available (expected on most systems)")
+        else:
+            print("\nNOTE: No NPU detected on this system")
+        
+        print()  # 空行
 
 
-
-            if gpu_now is not None:
-                avg_gpu.add(gpu_now)
-            if npu_now is not None:
-                avg_npu.add(npu_now)
-
-            # ----- AI活動検出とNPU使用推定 -----
-            current_ai_activity = ai_detector.get_current_ai_activity()
-            
-            # NPU推定値の更新
-            if current_ai_activity['active']:
-                npu_estimator.update_ai_cpu(cpu_overall)
-            else:
-                npu_estimator.update_baseline_cpu(cpu_overall)
-            
-            # AI活動状況の取得
-            ai_status, npu_estimated = format_ai_activity_status(ai_detector, npu_estimator)
-
-            print("\n" + "-"*78)
-
-            cpu_avg_str = f"{avg_cpu.average():5.1f}%" if avg_cpu.has_samples() else "  n/a"
-            cpu_line = "CPU   : avg {} | curr {:5.1f}% | per-core: {}".format(
-                cpu_avg_str,
-                cpu_overall,
-                ", ".join(f"{p:4.0f}%" for p in cpu_per)
-            )
-            print(cpu_line)
-
-            mem_avg_str = f"{avg_mem.average():5.1f}%" if avg_mem.has_samples() else "  n/a"
-            print(
-                "Memory: avg {} | curr {:5.1f}% ({}/{})".format(
-                    mem_avg_str,
-                    mem_percent,
-                    human_bytes(vm.used),
-                    human_bytes(vm.total),
-                )
-            )
-
-            if avg_disk_read.has_samples():
-                disk_avg = "R {} W {}".format(
-                    human_bytes_per_s(avg_disk_read.average()),
-                    human_bytes_per_s(avg_disk_write.average()),
-                )
-            else:
-                disk_avg = "n/a"
-            if disk_read_rate is not None and disk_write_rate is not None:
-                disk_curr = "R {} W {}".format(
-                    human_bytes_per_s(disk_read_rate),
-                    human_bytes_per_s(disk_write_rate),
-                )
-            else:
-                disk_curr = "n/a"
-            print(f"Disk  : avg {disk_avg} | curr {disk_curr}")
-
-            if avg_net_send.has_samples():
-                net_avg = "S {} R {}".format(
-                    human_bytes_per_s(avg_net_send.average()),
-                    human_bytes_per_s(avg_net_recv.average()),
-                )
-            else:
-                net_avg = "n/a"
-            if net_send_rate is not None and net_recv_rate is not None:
-                net_curr = "S {} R {}".format(
-                    human_bytes_per_s(net_send_rate),
-                    human_bytes_per_s(net_recv_rate),
-                )
-            else:
-                net_curr = "n/a"
-            print(f"Net   : avg {net_avg} | curr {net_curr}")
-
-            gpu_avg_str = f"{avg_gpu.average():5.1f}%" if avg_gpu.has_samples() else "  n/a"
-            gpu_curr_str = f"{gpu_now:5.1f}%" if gpu_now is not None else "  n/a"
-            gpu_top_str = format_top_list(gpu_top) if gpu_top else "n/a"
-            print(f"GPUComp: avg {gpu_avg_str} | curr {gpu_curr_str} | top {gpu_top_str}")  # Compute使用率を表示
-
-            # NPU/AI活動の表示
-            if npu_now is not None:
-                # PDH カウンターからの直接値がある場合
-                npu_curr_str = f"{npu_now:5.1f}%"
-                npu_status = ""
-            elif npu_estimated != "n/a":
-                # AI活動からの推定値がある場合
-                npu_curr_str = npu_estimated
-                npu_status = " (AI-estimated)"
-            else:
-                # 何も検出されない場合
-                npu_curr_str = "  n/a"
-                npu_status = ""
-            
-            # Intel AI Boost検出状況を含めた詳細表示
-            if intel_ai_boost_detected and npu_reader is None:
-                if current_ai_activity['active']:
-                    npu_status += f" (Intel AI Boost, {ai_status})"
-                else:
-                    npu_status += " (Intel AI Boost detected, no PDH counter)"
-            elif intel_ai_boost_detected:
-                npu_status += " (Intel AI Boost available)"
-            elif npu_reader is None:
-                if current_ai_activity['active']:
-                    npu_status += f" ({ai_status})"
-                else:
-                    npu_status += " (no NPU counter available)"
-            
-            npu_avg_str = f"{avg_npu.average():5.1f}%" if avg_npu.has_samples() else "  n/a"
-            npu_top_str = format_top_list(npu_top) if npu_top else "n/a"
-            
-            print(f"NPU   : avg {npu_avg_str} | curr {npu_curr_str} | top {npu_top_str}{npu_status}")
-
-
-
-            last_sample_ts = loop_start
-            time.sleep(REFRESH_SEC)
-
+class HardwareMonitor:
+    """ハードウェア監視のメインクラス"""
+    
+    def __init__(self):
+        self.system_collector = SystemCollector()
+        self.gpu_collector = PDHCollector(
+            r"\GPU Engine(*)\Utilization Percentage",
+            include_names=["Compute", "engtype_Compute"],
+            exclude_contains=["Copy", "Video", "3D"]
+        )
+        self.npu_collector = PDHCollector(r"\NPU Engine(*)\Utilization Percentage")
+        
+        # 統計計算用
+        self.averages = {
+            'cpu': RunningAverage(),
+            'memory': RunningAverage(),
+            'gpu': RunningAverage(),
+            'npu': RunningAverage(),
+            'disk_read': RunningAverage(),
+            'disk_write': RunningAverage(),
+            'net_send': RunningAverage(),
+            'net_recv': RunningAverage()
+        }
+        
+        # NPU検出情報
+        self.intel_ai_boost_detected = NPUDetector.detect_intel_ai_boost()
+    
+    def start_monitoring(self):
+        """監視開始"""
+        self.print_header()
+        NPUDetector.print_npu_status()
+        
+        psutil.cpu_percent(interval=None)  # CPU priming
+        
+        try:
+            while True:
+                self.collect_and_display_metrics()
+                time.sleep(REFRESH_SEC)
         except KeyboardInterrupt:
-            break
-
-    # クリーンアップ
-    ai_detector.stop_monitoring()
+            pass
+    
+    def collect_and_display_metrics(self):
+        """メトリクス収集と表示"""
+        # システムメトリクス収集
+        sys_data = self.system_collector.collect()
+        gpu_data = self.gpu_collector.collect()
+        npu_data = self.npu_collector.collect()
+        
+        # 統計更新
+        self.update_averages(sys_data, gpu_data, npu_data)
+        
+        # 表示
+        self.display_metrics(sys_data, gpu_data, npu_data)
+    
+    def update_averages(self, sys_data: Dict, gpu_data: Dict, npu_data: Dict):
+        """平均値を更新"""
+        self.averages['cpu'].add(sys_data['cpu_overall'])
+        self.averages['memory'].add(sys_data['memory_percent'])
+        
+        if sys_data['disk_read_rate'] is not None:
+            self.averages['disk_read'].add(sys_data['disk_read_rate'])
+            self.averages['disk_write'].add(sys_data['disk_write_rate'])
+        
+        if sys_data['net_send_rate'] is not None:
+            self.averages['net_send'].add(sys_data['net_send_rate'])
+            self.averages['net_recv'].add(sys_data['net_recv_rate'])
+        
+        if gpu_data:
+            gpu_overall, _ = UtilityFunctions.summarize_engine_util(gpu_data, ["Compute", "engtype_Compute"])
+            self.averages['gpu'].add(gpu_overall)
+        
+        if npu_data:
+            npu_overall, _ = UtilityFunctions.summarize_engine_util(npu_data)
+            self.averages['npu'].add(npu_overall)
+    
+    def display_metrics(self, sys_data: Dict, gpu_data: Dict, npu_data: Dict):
+        """メトリクス表示"""
+        print("\n" + "-"*78)
+        
+        # CPU
+        cpu_avg = f"{self.averages['cpu'].average():5.1f}%" if self.averages['cpu'].has_samples() else "  n/a"
+        cpu_cores = ", ".join(f"{p:4.0f}%" for p in sys_data['cpu_per_core'])
+        print(f"CPU   : avg {cpu_avg} | curr {sys_data['cpu_overall']:5.1f}% | per-core: {cpu_cores}")
+        
+        # Memory
+        mem_avg = f"{self.averages['memory'].average():5.1f}%" if self.averages['memory'].has_samples() else "  n/a"
+        mem_used = UtilityFunctions.human_bytes(sys_data['memory_used'])
+        mem_total = UtilityFunctions.human_bytes(sys_data['memory_total'])
+        print(f"Memory: avg {mem_avg} | curr {sys_data['memory_percent']:5.1f}% ({mem_used}/{mem_total})")
+        
+        # Disk
+        disk_avg = self.format_disk_net_avg('disk')
+        disk_curr = self.format_disk_curr(sys_data['disk_read_rate'], sys_data['disk_write_rate'])
+        print(f"Disk  : avg {disk_avg} | curr {disk_curr}")
+        
+        # Network
+        net_avg = self.format_disk_net_avg('net')
+        net_curr = self.format_net_curr(sys_data['net_send_rate'], sys_data['net_recv_rate'])
+        print(f"Net   : avg {net_avg} | curr {net_curr}")
+        
+        # GPU
+        gpu_overall, gpu_top = UtilityFunctions.summarize_engine_util(gpu_data, ["Compute", "engtype_Compute"])
+        gpu_avg = f"{self.averages['gpu'].average():5.1f}%" if self.averages['gpu'].has_samples() else "  n/a"
+        gpu_curr = f"{gpu_overall:5.1f}%" if gpu_data else "  n/a"
+        gpu_top_str = UtilityFunctions.format_top_list(gpu_top) if gpu_top else "n/a"
+        print(f"GPUComp: avg {gpu_avg} | curr {gpu_curr} | top {gpu_top_str}")
+        
+        # NPU
+        npu_overall, npu_top = UtilityFunctions.summarize_engine_util(npu_data)
+        npu_status = self.format_npu_status(npu_overall)
+        npu_avg = f"{self.averages['npu'].average():5.1f}%" if self.averages['npu'].has_samples() else "  n/a"
+        npu_curr = f"{npu_overall:5.1f}%" if npu_data else "  n/a"
+        npu_top_str = UtilityFunctions.format_top_list(npu_top) if npu_top else "n/a"
+        print(f"NPU   : avg {npu_avg} | curr {npu_curr} | top {npu_top_str}{npu_status}")
+    
+    def format_disk_net_avg(self, type_name: str) -> str:
+        """ディスク/ネットワークの平均値をフォーマット"""
+        if type_name == 'disk':
+            read_avg, write_avg = self.averages['disk_read'], self.averages['disk_write']
+            prefix = "R"
+        else:
+            read_avg, write_avg = self.averages['net_send'], self.averages['net_recv']
+            prefix = "S"
+        
+        if read_avg.has_samples():
+            return f"{prefix} {UtilityFunctions.human_bytes_per_s(read_avg.average())} W {UtilityFunctions.human_bytes_per_s(write_avg.average())}"
+        return "n/a"
+    
+    def format_disk_curr(self, read_rate: Optional[float], write_rate: Optional[float]) -> str:
+        """ディスクの現在値をフォーマット"""
+        if read_rate is not None and write_rate is not None:
+            return f"R {UtilityFunctions.human_bytes_per_s(read_rate)} W {UtilityFunctions.human_bytes_per_s(write_rate)}"
+        return "n/a"
+    
+    def format_net_curr(self, send_rate: Optional[float], recv_rate: Optional[float]) -> str:
+        """ネットワークの現在値をフォーマット"""
+        if send_rate is not None and recv_rate is not None:
+            return f"S {UtilityFunctions.human_bytes_per_s(send_rate)} R {UtilityFunctions.human_bytes_per_s(recv_rate)}"
+        return "n/a"
+    
+    def format_npu_status(self, npu_overall: float) -> str:
+        """NPUステータスをフォーマット"""
+        if npu_overall > 0:
+            return ""
+        elif self.intel_ai_boost_detected:
+            return " (Intel AI Boost detected, no PDH counter)"
+        else:
+            return " (no NPU counter available)"
+    
+    def print_header(self):
+        """ヘッダー表示"""
+        print("="*78)
+        print(" Windows Hardware Utilization Monitor (Task Manager-like) ")
+        print("="*78)
+        print("Ctrl+C to stop\n")
 
 if __name__ == "__main__":
-    main()
+    monitor = HardwareMonitor()
+    monitor.start_monitoring()
