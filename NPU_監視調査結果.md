@@ -128,11 +128,52 @@ working_patterns = [
 }
 ```
 
-## 🎯 **結論**
+## 🔥 **最新発見: Windows Performance Toolkit活用**
 
-1. **現状**: Windows 11では直接的NPUカウンターは未提供
-2. **代替案**: GPU Computeエンジン + AI プロセス監視が最適
-3. **実用性**: `final_npu_monitor.py`で実用的監視が可能
-4. **将来性**: Windows更新で直接監視が改善される見込み
+### 🎯 **ETW (Event Tracing for Windows) によるNPU監視**
+
+**重要発見**: Intel NPU専用のETWプロバイダーが存在！
+
+```python
+# 発見されたIntel NPU ETWプロバイダー
+npu_providers = {
+    "Intel-NPU-D3D12": "{11A83531-4AC9-4142-8D35-E474B6B3C597}",
+    "Intel-NPU-Kmd": "{B3B1AAB1-3C04-4B6D-A069-59547BC18233}", 
+    "Intel-NPU-LevelZero": "{416F823F-2CE2-44B9-A1BA-7E98BA4CD4BA}"
+}
+```
+
+### 📊 **完全なNPU環境確認結果**
+
+✅ **NPUハードウェア**: Intel(R) AI Boost - 動作正常  
+✅ **NPUドライバー**: `npu_kmd.sys` 他13ファイル - 正常インストール済み  
+✅ **Intel Graphics**: Arc 140V GPU (ドライバー: 32.0.101.6881)  
+✅ **ETWプロバイダー**: 3個のIntel NPU専用プロバイダー発見  
+
+### ⚡ **実用的NPU監視コマンド**
+
+**ETW直接監視** (管理者権限必要):
+```powershell
+# Intel NPU Kernel Mode Driver監視
+logman start "NPU_Monitor" -p "{B3B1AAB1-3C04-4B6D-A069-59547BC18233}" -o npu_trace.etl -ets
+
+# NPU活動監視中...
+# AI workloadを実行
+
+# 監視停止
+logman stop "NPU_Monitor" -ets
+
+# トレース分析
+wpa.exe npu_trace.etl
+```
+
+## 🎯 **更新された結論**
+
+1. **現状**: Intel NPUハードウェア・ドライバー完全対応済み
+2. **直接監視**: ETWプロバイダーによる精密なNPU監視が可能
+3. **実用性**: 
+   - `intel_npu_etw_monitor.py` - ETW直接監視 (要管理者権限)
+   - `final_npu_monitor.py` - 間接監視 (通常権限)
+4. **最適解**: ETW + 間接監視のハイブリッドアプローチ
 
 Intel AI Boost NPUハードウェアは検出されているため、適切な監視インフラとAPIが整備されれば、将来的にはより精密な監視が可能になると予想されます。
